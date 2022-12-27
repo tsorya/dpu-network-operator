@@ -8,6 +8,7 @@ require (
 	github.com/onsi/gomega v1.18.1
 	github.com/openshift/cluster-network-operator v0.0.0-20210929154004-c02b3c8a1d9a
 	github.com/openshift/machine-config-operator v0.0.1-0.20201023110058-6c8bd9b2915c
+	github.com/sirupsen/logrus v1.8.1
 	github.com/submariner-io/admiral v0.12.0
 	k8s.io/api v0.22.1
 	k8s.io/apimachinery v0.22.1
