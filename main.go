@@ -18,6 +18,8 @@ package main
 
 import (
 	"flag"
+	"github.com/openshift/dpu-network-operator/pkg/utils"
+	"github.com/sirupsen/logrus"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -80,17 +82,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controllers.OVNKubeConfigReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "OVNKubeConfig")
-		os.Exit(1)
-	}
+	//if err = (&controllers.OVNKubeConfigReconciler{
+	//	Client: mgr.GetClient(),
+	//	Scheme: mgr.GetScheme(),
+	//}).SetupWithManager(mgr); err != nil {
+	//	setupLog.Error(err, "unable to create controller", "controller", "OVNKubeConfig")
+	//	os.Exit(1)
+	//}
 
-	if err = (&controllers.DpuController{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+	if err = (&controllers.DpuNodeController{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Log:       logrus.New(),
+		Namespace: utils.Namespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DpuController")
 		os.Exit(1)

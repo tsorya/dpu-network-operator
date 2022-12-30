@@ -77,18 +77,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - apps
-  resources:
-  - poddisruptionbudgets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
   - dpu.openshift.io
   resources:
   - ovnkubeconfigs
@@ -130,6 +118,18 @@ rules:
   - machineconfiguration.openshift.io
   resources:
   - machineconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
   verbs:
   - create
   - delete

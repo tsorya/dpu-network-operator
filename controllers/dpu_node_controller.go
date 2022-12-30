@@ -26,44 +26,45 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-type DpuController struct {
+type DpuNodeController struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Log    logrus.FieldLogger
+	Scheme    *runtime.Scheme
+	Log       logrus.FieldLogger
+	Namespace string
 }
 
 const (
 	dpuNodeLabel     = "node-role.kubernetes.io/worker"
 	deploymentPrefix = "dpu-drain-blocker-"
-	pdbPrefix        = "dpu-drain-blocker-"
 )
 
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=apps,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-//
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.9.2/pkg/reconcile
-func (r *DpuController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *DpuNodeController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithFields(
 		logrus.Fields{
-			"node_name": req.Name,
+			"node_name":          req.Name,
+			"operator namespace": r.Namespace,
 		})
 
-	namespace := req.NamespacedName.Namespace
+	namespace := r.Namespace
 	node := &corev1.Node{}
-	log.Infof("AAAAAAAAAAAAAAAAAAAAAAAA %s %s %s", req.Name, req.Namespace, req.String())
-
 	if err := r.Get(ctx, req.NamespacedName, node); err != nil {
 		log.WithError(err).Errorf("Failed to get node %s", req.Name)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -80,10 +81,14 @@ func (r *DpuController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 
+	if err := r.ensurePDB(log, node, namespace); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
 }
 
-func (r *DpuController) ensureDeployment(log logrus.FieldLogger, node *corev1.Node, namespace string) error {
+func (r *DpuNodeController) ensureDeployment(log logrus.FieldLogger, node *corev1.Node, namespace string) error {
 	log.Infof("Ensure blocking deployment")
 	expectedDeployment := r.getDeployment(node, namespace)
 	deployment := &appsv1.Deployment{}
@@ -105,11 +110,16 @@ func (r *DpuController) ensureDeployment(log logrus.FieldLogger, node *corev1.No
 	return err
 }
 
-func (r *DpuController) ensurePDB(log logrus.FieldLogger, node *corev1.Node, namespace string) error {
-	log.Infof("Ensure blocking deployment")
+func (r *DpuNodeController) ensurePDB(log logrus.FieldLogger, node *corev1.Node, namespace string) error {
+	// if node is Unschedulable, we should not fix pdb
+	if node.Spec.Unschedulable {
+		return nil
+	}
+
+	log.Infof("Ensure blocking pdb")
 	expectedPDB := r.getPDB(node, namespace)
 	pdb := &policyv1.PodDisruptionBudget{}
-	err := r.Get(context.TODO(), types.NamespacedName{Name: deploymentPrefix + node.Name, Namespace: namespace}, pdb)
+	err := r.Get(context.TODO(), types.NamespacedName{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace}, pdb)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			err = r.Create(context.TODO(), expectedPDB)
@@ -119,19 +129,22 @@ func (r *DpuController) ensurePDB(log logrus.FieldLogger, node *corev1.Node, nam
 			}
 			log.Infof("Created PDB for %s", node.Name)
 		} else {
+			log.WithError(err).Errorf("Failed to get pdb %s", expectedPDB.Name)
 			return err
 		}
 		return nil
 	}
 	// if pdb was not changed, nothing to do
-	// if node is Unschedulable, we should not fix pdb
-	if pdb.Spec.MaxUnavailable.IntVal == 0 || node.Spec.Unschedulable {
+	if *pdb.Spec.MaxUnavailable == *expectedPDB.Spec.MaxUnavailable {
 		return nil
 	}
 
+	// Set expected spec
+	pdb.Spec = expectedPDB.Spec
 	// This should run only in case pdb was changed and not is schedulable
 	// will allow to set back pdb value after reboot
-	err = r.Update(context.TODO(), expectedPDB)
+	log.Infof("PDB was changed and node is schedulable, changing it back")
+	err = r.Update(context.TODO(), pdb)
 	if err != nil {
 		log.WithError(err).Errorf("Failed update pdb %s to it's previous value", expectedPDB.Name)
 	}
@@ -139,7 +152,7 @@ func (r *DpuController) ensurePDB(log logrus.FieldLogger, node *corev1.Node, nam
 	return err
 }
 
-func (r *DpuController) getPDB(node *corev1.Node, namespace string) *policyv1.PodDisruptionBudget {
+func (r *DpuNodeController) getPDB(node *corev1.Node, namespace string) *policyv1.PodDisruptionBudget {
 	pdb := policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      deploymentPrefix + node.Name,
@@ -159,30 +172,31 @@ func (r *DpuController) getPDB(node *corev1.Node, namespace string) *policyv1.Po
 	return &pdb
 }
 
-func (r *DpuController) getDeployment(node *corev1.Node, namespace string) *appsv1.Deployment {
+func (r *DpuNodeController) getDeployment(node *corev1.Node, namespace string) *appsv1.Deployment {
 	replicas := int32(1)
+	labels := map[string]string{
+		"app": deploymentPrefix + node.Name,
+	}
 	deployment := appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      deploymentPrefix + node.Name,
 			Namespace: namespace,
+			Labels:    labels,
 		},
+
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app": deploymentPrefix + node.Name,
-				},
+				MatchLabels: labels,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app": "demo",
-					},
+					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name: "sleep_forever",
+							Name: "sleep-forever",
 							// TODO  change image
 							Image: "quay.io/itsoiref/sleep:latest",
 						},
@@ -199,10 +213,27 @@ func (r *DpuController) getDeployment(node *corev1.Node, namespace string) *apps
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *DpuController) SetupWithManager(mgr ctrl.Manager) error {
+func (r *DpuNodeController) SetupWithManager(mgr ctrl.Manager) error {
+	mapToNode := func(obj client.Object) []reconcile.Request {
+		name := obj.GetName()
+		namespace := obj.GetNamespace()
+		if namespace != r.Namespace || !strings.HasPrefix(name, deploymentPrefix) || len(strings.Split(name, deploymentPrefix)) < 2{
+			return []reconcile.Request{}
+		}
+
+		r.Log.Infof("Mapping node for obj %s in namespace %s of kind %v", name, name, obj.GetObjectKind())
+
+		reply := make([]reconcile.Request, 0, 1)
+		reply = append(reply, reconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name: strings.Split(name, deploymentPrefix)[1],
+		}})
+		return reply
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}).
-		Owns(&policyv1.PodDisruptionBudget{}).
-		Owns(&appsv1.Deployment{}).
+		Watches(&source.Kind{Type: &policyv1.PodDisruptionBudget{}}, handler.EnqueueRequestsFromMapFunc(mapToNode)).
+		Watches(&source.Kind{Type: &appsv1.Deployment{}}, handler.EnqueueRequestsFromMapFunc(mapToNode)).
 		Complete(r)
 }
