@@ -57,6 +57,8 @@ const (
 )
 
 var logger = log.Log.WithName("controller_ovnkubeconfig")
+// TODO: find a better way to share kubeconfig between clusters
+var TenantRestConfig *rest.Config
 
 const (
 	OVN_NB_PORT = "9641"
@@ -69,7 +71,6 @@ type OVNKubeConfigReconciler struct {
 	Scheme           *runtime.Scheme
 	syncer           *syncer.OvnkubeSyncer
 	stopCh           chan struct{}
-	tenantRestConfig *rest.Config
 }
 
 //+kubebuilder:rbac:groups=dpu.openshift.io,resources=ovnkubeconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -194,7 +195,7 @@ func (r *OVNKubeConfigReconciler) startTenantSyncer(ctx context.Context, cfg *dp
 		return fmt.Errorf("key 'config' cannot be found in secret %s", cfg.Spec.KubeConfigFile)
 	}
 
-	r.tenantRestConfig, err = clientcmd.RESTConfigFromKubeConfig(bytes)
+	TenantRestConfig, err = clientcmd.RESTConfigFromKubeConfig(bytes)
 	if err != nil {
 		return err
 	}
@@ -203,7 +204,7 @@ func (r *OVNKubeConfigReconciler) startTenantSyncer(ctx context.Context, cfg *dp
 		// LocalClusterID:   cfg.Namespace,
 		LocalRestConfig:  ctrl.GetConfigOrDie(),
 		LocalNamespace:   cfg.Namespace,
-		TenantRestConfig: r.tenantRestConfig,
+		TenantRestConfig: TenantRestConfig,
 		TenantNamespace:  utils.TenantNamespace}, cfg, r.Scheme)
 	if err != nil {
 		return err
@@ -379,7 +380,7 @@ func (r *OVNKubeConfigReconciler) syncMachineConfigObjs(cs dpuv1alpha1.OVNKubeCo
 }
 
 func (r *OVNKubeConfigReconciler) getTenantClusterMasterIPs(ctx context.Context) ([]string, error) {
-	c, err := client.New(r.tenantRestConfig, client.Options{})
+	c, err := client.New(TenantRestConfig, client.Options{})
 	if err != nil {
 		logger.Error(err, "Fail to create client for the tenant cluster")
 		return []string{}, err

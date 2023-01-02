@@ -18,18 +18,24 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"github.com/openshift/dpu-network-operator/pkg/utils"
 	"github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	machineryLabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	nmoapiv1beta1 "github.com/medik8s/node-maintenance-operator/api/v1beta1"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -46,6 +52,7 @@ type DpuNodeController struct {
 const (
 	dpuNodeLabel     = "node-role.kubernetes.io/worker"
 	deploymentPrefix = "dpu-drain-blocker-"
+	maintenancePrefix = "dpu-tenant-"
 )
 
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
@@ -84,6 +91,14 @@ func (r *DpuNodeController) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.ensurePDB(log, node, namespace); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// no tenant kubeconfig -> do nothing
+	if TenantRestConfig == nil {
+		return ctrl.Result{}, nil
+	}
+
+
+
 
 	return ctrl.Result{}, nil
 }
@@ -210,6 +225,88 @@ func (r *DpuNodeController) getDeployment(node *corev1.Node, namespace string) *
 	}
 
 	return &deployment
+}
+
+func (r *DpuNodeController) ensureTenantNode(node *corev1.Node, shouldBeDrained bool) (ctrl.Result, error) {
+	if TenantRestConfig == nil {
+		return ctrl.Result{},nil
+	}
+
+	c, err := client.New(TenantRestConfig, client.Options{})
+	if err != nil {
+		r.Log.WithError(err).Errorf("Fail to create client for the tenant cluster")
+		return ctrl.Result{}, err
+	}
+
+	//TODO: find dpu tenant node
+	// maybe possible by hostname? What label should be set?
+	nodes := corev1.NodeList{}
+	labelSelector := machineryLabels.SelectorFromSet(map[string]string{"dpu": "some-label-that-matches-dpu"})
+	listOps := &client.ListOptions{LabelSelector: labelSelector}
+	err = c.List(context.TODO(), &nodes, listOps)
+	if err != nil {
+		r.Log.WithError(err).Error("Failed to list tenant nodes")
+		return ctrl.Result{}, err
+	}
+
+	// TODO: find host
+	tenantNode := nodes.Items[0]
+	return r.handleNMO(tenantNode.Name, shouldBeDrained)
+}
+
+func (r *DpuNodeController) handleNMO(tenantNodeHostname string, shouldBeDrained bool) (bool, error) {
+	// TODO find nodeMaintenance per this host
+
+	nmName := maintenancePrefix + tenantNodeHostname
+	nm := &nmoapiv1beta1.NodeMaintenance{}
+	typedNM := types.NamespacedName{Name: nmName, Namespace: utils.TenantNamespace}
+
+
+	// TODO: maybe need to set different namespace?
+	err := r.Get(context.TODO(), typedNM, nm)
+	if err != nil {
+		if errors.IsNotFound(err) && shouldBeDrained {
+			// Nothing to do
+			if !shouldBeDrained {
+				return true,  nil
+			}
+
+			err = r.Create(context.TODO(), &nmoapiv1beta1.NodeMaintenance{
+				TypeMeta:   metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: nmName,
+					Namespace: utils.TenantNamespace,
+				},
+				Spec:       nmoapiv1beta1.NodeMaintenanceSpec{
+					NodeName: tenantNodeHostname,
+					Reason: "Infra dpu is going to reboot",
+				},
+			})
+			if err != nil {
+				r.Log.WithError(err).Errorf("failed to create node maintenance for %s", tenantNodeHostname)
+				return false, err
+			}
+			return false, nil
+		} else {
+			r.Log.WithError(err).Errorf("failed to get node maintenance %s in tenant cluster", nmName)
+			return false, err
+		}
+	}
+
+	// node is draining
+	if shouldBeDrained && nm.Status.Phase == nmoapiv1beta1.MaintenanceRunning {
+		return false, nil
+	}
+
+	// node should not be drained, delete nodeMaintenance
+	if !shouldBeDrained {
+		if err := r.Delete(context.TODO(), nm);  err != nil {
+			r.Log.WithError(err).Errorf("Failed to delete node maintenance cr %s", nmName)
+			return false, err
+		}
+	}
+
+	return true, err
 }
 
 // SetupWithManager sets up the controller with the Manager.
