@@ -88,13 +88,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	//if err = (&controllers.OVNKubeConfigReconciler{
-	//	Client: mgr.GetClient(),
-	//	Scheme: mgr.GetScheme(),
-	//}).SetupWithManager(mgr); err != nil {
-	//	setupLog.Error(err, "unable to create controller", "controller", "OVNKubeConfig")
-	//	os.Exit(1)
-	//}
+	if err = (&controllers.OVNKubeConfigReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "OVNKubeConfig")
+		os.Exit(1)
+	}
 
 	if err = (&controllers.DpuNodeController{
 		Client:    mgr.GetClient(),
