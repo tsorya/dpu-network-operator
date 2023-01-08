@@ -146,3 +146,11 @@ rules:
   - securitycontextconstraints
   verbs:
   - use
+- apiGroups:
+  - security.openshift.io
+  resourceNames:
+  - hostnetwork
+  resources:
+  - securitycontextconstraints
+  verbs:
+  - use

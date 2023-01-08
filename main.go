@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	nmoapiv1beta1 "github.com/medik8s/node-maintenance-operator/api/v1beta1"
 	"github.com/openshift/dpu-network-operator/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"os"
@@ -68,6 +69,11 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	err := nmoapiv1beta1.AddToScheme(scheme)
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,

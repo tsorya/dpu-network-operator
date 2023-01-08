@@ -57,6 +57,7 @@ const (
 )
 
 var logger = log.Log.WithName("controller_ovnkubeconfig")
+
 // TODO: find a better way to share kubeconfig between clusters
 var TenantRestConfig *rest.Config
 
@@ -68,9 +69,9 @@ const (
 // OVNKubeConfigReconciler reconciles a OVNKubeConfig object
 type OVNKubeConfigReconciler struct {
 	client.Client
-	Scheme           *runtime.Scheme
-	syncer           *syncer.OvnkubeSyncer
-	stopCh           chan struct{}
+	Scheme *runtime.Scheme
+	syncer *syncer.OvnkubeSyncer
+	stopCh chan struct{}
 }
 
 //+kubebuilder:rbac:groups=dpu.openshift.io,resources=ovnkubeconfigs,verbs=get;list;watch;create;update;patch;delete

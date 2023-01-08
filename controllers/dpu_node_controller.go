@@ -18,7 +18,7 @@ package controllers
 
 import (
 	"context"
-	"fmt"
+	nmoapiv1beta1 "github.com/medik8s/node-maintenance-operator/api/v1beta1"
 	"github.com/openshift/dpu-network-operator/pkg/utils"
 	"github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,11 +29,10 @@ import (
 	machineryLabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-	nmoapiv1beta1 "github.com/medik8s/node-maintenance-operator/api/v1beta1"
 	"strings"
 	"time"
 
@@ -50,14 +49,15 @@ type DpuNodeController struct {
 }
 
 const (
-	dpuNodeLabel     = "node-role.kubernetes.io/worker"
-	deploymentPrefix = "dpu-drain-blocker-"
+	dpuNodeLabel      = "node-role.kubernetes.io/dpu-worker"
+	deploymentPrefix  = "dpu-drain-blocker-"
 	maintenancePrefix = "dpu-tenant-"
 )
 
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,resourceNames=hostnetwork,verbs=use
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -88,17 +88,25 @@ func (r *DpuNodeController) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	if err := r.ensurePDB(log, node, namespace); err != nil {
+	// TODO: need to handle it some other way
+	if TenantRestConfig == nil {
+		r.getKubeconfig()
+	}
+
+	dependsOnTenant := TenantRestConfig != nil
+	allowedDrain, requiresRetry := false, false
+	var tenantErr error
+	if dependsOnTenant {
+		allowedDrain, requiresRetry, tenantErr = r.isTenantDrainedIfRequired(node)
+	}
+
+	if err := r.ensurePDB(log, node, namespace, allowedDrain); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// no tenant kubeconfig -> do nothing
-	if TenantRestConfig == nil {
-		return ctrl.Result{}, nil
+	if requiresRetry || tenantErr != nil {
+		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 	}
-
-
-
 
 	return ctrl.Result{}, nil
 }
@@ -125,14 +133,14 @@ func (r *DpuNodeController) ensureDeployment(log logrus.FieldLogger, node *corev
 	return err
 }
 
-func (r *DpuNodeController) ensurePDB(log logrus.FieldLogger, node *corev1.Node, namespace string) error {
-	// if node is Unschedulable, we should not fix pdb
-	if node.Spec.Unschedulable {
+func (r *DpuNodeController) ensurePDB(log logrus.FieldLogger, node *corev1.Node, namespace string, allowDrain bool) error {
+	//// if node is Unschedulable, we should not fix pdb
+	if node.Spec.Unschedulable && !allowDrain {
 		return nil
 	}
 
 	log.Infof("Ensure blocking pdb")
-	expectedPDB := r.getPDB(node, namespace)
+	expectedPDB := r.getPDB(node, namespace, allowDrain)
 	pdb := &policyv1.PodDisruptionBudget{}
 	err := r.Get(context.TODO(), types.NamespacedName{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace}, pdb)
 	if err != nil {
@@ -158,7 +166,12 @@ func (r *DpuNodeController) ensurePDB(log logrus.FieldLogger, node *corev1.Node,
 	pdb.Spec = expectedPDB.Spec
 	// This should run only in case pdb was changed and not is schedulable
 	// will allow to set back pdb value after reboot
-	log.Infof("PDB was changed and node is schedulable, changing it back")
+	if allowDrain {
+		log.Infof("Drain is allowed, setting max available to 1")
+	} else {
+		log.Infof("PDB was changed and node is schedulable, changing it back")
+	}
+
 	err = r.Update(context.TODO(), pdb)
 	if err != nil {
 		log.WithError(err).Errorf("Failed update pdb %s to it's previous value", expectedPDB.Name)
@@ -167,7 +180,11 @@ func (r *DpuNodeController) ensurePDB(log logrus.FieldLogger, node *corev1.Node,
 	return err
 }
 
-func (r *DpuNodeController) getPDB(node *corev1.Node, namespace string) *policyv1.PodDisruptionBudget {
+func (r *DpuNodeController) getPDB(node *corev1.Node, namespace string, allowDrain bool) *policyv1.PodDisruptionBudget {
+	maxUnavailable := int32(0)
+	if allowDrain {
+		maxUnavailable = 1
+	}
 	pdb := policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      deploymentPrefix + node.Name,
@@ -175,7 +192,7 @@ func (r *DpuNodeController) getPDB(node *corev1.Node, namespace string) *policyv
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MaxUnavailable: &intstr.IntOrString{
-				IntVal: int32(0),
+				IntVal: maxUnavailable,
 			},
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
@@ -209,6 +226,7 @@ func (r *DpuNodeController) getDeployment(node *corev1.Node, namespace string) *
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					HostNetwork: true,
 					Containers: []corev1.Container{
 						{
 							Name: "sleep-forever",
@@ -227,59 +245,93 @@ func (r *DpuNodeController) getDeployment(node *corev1.Node, namespace string) *
 	return &deployment
 }
 
-func (r *DpuNodeController) ensureTenantNode(node *corev1.Node, shouldBeDrained bool) (ctrl.Result, error) {
-	if TenantRestConfig == nil {
-		return ctrl.Result{},nil
-	}
-
-	c, err := client.New(TenantRestConfig, client.Options{})
+func (r *DpuNodeController) isTenantDrainedIfRequired(node *corev1.Node) (bool, bool, error) {
+	tenantClient, err := client.New(TenantRestConfig, client.Options{})
 	if err != nil {
 		r.Log.WithError(err).Errorf("Fail to create client for the tenant cluster")
-		return ctrl.Result{}, err
+		return false, false, err
+	}
+	nmoapiv1beta1.AddToScheme(tenantClient.Scheme())
+	tenantNode, err := r.getMatchedTenantNodeByCM(node)
+	if err != nil {
+		r.Log.WithError(err).Errorf("failed to get tenant node that matches %s", node.Name)
+		return false, false, err
+	}
+	if tenantNode == "" {
+		r.Log.Warnf("Failed to find tenant node")
+		return false, false, nil
 	}
 
+	shouldBeDrained := node.Spec.Unschedulable == true
+
+	drained, err := r.handleNMO(tenantClient, tenantNode, shouldBeDrained)
+	if err != nil {
+		r.Log.WithError(err).Errorf("failed to cordon/uncordon tenant node %s", tenantNode)
+		return false, false, err
+	}
+
+	if drained && shouldBeDrained {
+		return true, false, nil
+	} else if !drained && shouldBeDrained {
+		return false, true, nil
+	}
+	return false, false, nil
+}
+
+func (r *DpuNodeController) getMatchedTenantNode(tenantClient client.Client, node *corev1.Node) (*corev1.Node, error) {
 	//TODO: find dpu tenant node
 	// maybe possible by hostname? What label should be set?
 	nodes := corev1.NodeList{}
-	labelSelector := machineryLabels.SelectorFromSet(map[string]string{"dpu": "some-label-that-matches-dpu"})
+	labelSelector := machineryLabels.SelectorFromSet(map[string]string{"dpu-tenant": node.Name})
 	listOps := &client.ListOptions{LabelSelector: labelSelector}
-	err = c.List(context.TODO(), &nodes, listOps)
+	err := tenantClient.List(context.TODO(), &nodes, listOps)
 	if err != nil {
 		r.Log.WithError(err).Error("Failed to list tenant nodes")
-		return ctrl.Result{}, err
+		return nil, err
+	}
+	if len(nodes.Items) < 1 {
+		r.Log.Infof("Failed to find tenant host that matches %s dpu", node.Name)
+		return nil, nil
 	}
 
 	// TODO: find host
-	tenantNode := nodes.Items[0]
-	return r.handleNMO(tenantNode.Name, shouldBeDrained)
+	return &nodes.Items[0], nil
 }
 
-func (r *DpuNodeController) handleNMO(tenantNodeHostname string, shouldBeDrained bool) (bool, error) {
-	// TODO find nodeMaintenance per this host
+func (r *DpuNodeController) getMatchedTenantNodeByCM(node *corev1.Node) (string, error) {
+	tenantConfig, err := utils.LoadConfig(node.Name)
+	if err != nil {
+		r.Log.WithError(err).Errorf("Failed to get matched tenant node from configmap mount file for node %s", node.Name)
+		return "", nil
+	}
+	r.Log.Infof("Found tenant node %s", tenantConfig.TenantHostname)
+	return tenantConfig.TenantHostname, nil
+}
 
+func (r *DpuNodeController) handleNMO(tenantClient client.Client, tenantNodeHostname string, shouldBeDrained bool) (bool, error) {
+	// TODO find nodeMaintenance per this host
 	nmName := maintenancePrefix + tenantNodeHostname
 	nm := &nmoapiv1beta1.NodeMaintenance{}
 	typedNM := types.NamespacedName{Name: nmName, Namespace: utils.TenantNamespace}
 
-
 	// TODO: maybe need to set different namespace?
-	err := r.Get(context.TODO(), typedNM, nm)
+	err := tenantClient.Get(context.TODO(), typedNM, nm)
 	if err != nil {
-		if errors.IsNotFound(err) && shouldBeDrained {
+		if errors.IsNotFound(err) {
 			// Nothing to do
 			if !shouldBeDrained {
-				return true,  nil
+				return true, nil
 			}
 
-			err = r.Create(context.TODO(), &nmoapiv1beta1.NodeMaintenance{
-				TypeMeta:   metav1.TypeMeta{},
+			err = tenantClient.Create(context.TODO(), &nmoapiv1beta1.NodeMaintenance{
+				TypeMeta: metav1.TypeMeta{},
 				ObjectMeta: metav1.ObjectMeta{
-					Name: nmName,
+					Name:      nmName,
 					Namespace: utils.TenantNamespace,
 				},
-				Spec:       nmoapiv1beta1.NodeMaintenanceSpec{
+				Spec: nmoapiv1beta1.NodeMaintenanceSpec{
 					NodeName: tenantNodeHostname,
-					Reason: "Infra dpu is going to reboot",
+					Reason:   "Infra dpu is going to reboot",
 				},
 			})
 			if err != nil {
@@ -300,7 +352,7 @@ func (r *DpuNodeController) handleNMO(tenantNodeHostname string, shouldBeDrained
 
 	// node should not be drained, delete nodeMaintenance
 	if !shouldBeDrained {
-		if err := r.Delete(context.TODO(), nm);  err != nil {
+		if err := tenantClient.Delete(context.TODO(), nm); err != nil {
 			r.Log.WithError(err).Errorf("Failed to delete node maintenance cr %s", nmName)
 			return false, err
 		}
@@ -309,12 +361,49 @@ func (r *DpuNodeController) handleNMO(tenantNodeHostname string, shouldBeDrained
 	return true, err
 }
 
+// TODO: this is only temporary for now
+// No need to return error as it is used only for manual testing currently
+func (r *DpuNodeController) getKubeconfig() {
+	if TenantRestConfig != nil {
+		return
+	}
+
+	logger.Info("tempopary get tenant kubeconfig")
+	var err error
+
+	s := &corev1.Secret{}
+	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: "tenant-kubeconfig", Namespace: utils.Namespace}, s)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			r.Log.Infof("No secret tenant-kubeconfig in %s", utils.Namespace)
+			return
+		}
+		r.Log.WithError(err).Warnf("Failed to get tenant kubeconfig though it exists")
+		if err != nil {
+			return
+		}
+	}
+
+	bytes, ok := s.Data["config"]
+	if !ok {
+		r.Log.WithError(err).Warnf("Failed to get tenant kubeconfig, key \"config\" doesn't exist")
+		return
+	}
+
+	TenantRestConfig, err = clientcmd.RESTConfigFromKubeConfig(bytes)
+	if err != nil {
+		r.Log.WithError(err).Warnf("Failed to create tenant rest config from given kubeconfig")
+	}
+
+	return
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *DpuNodeController) SetupWithManager(mgr ctrl.Manager) error {
 	mapToNode := func(obj client.Object) []reconcile.Request {
 		name := obj.GetName()
 		namespace := obj.GetNamespace()
-		if namespace != r.Namespace || !strings.HasPrefix(name, deploymentPrefix) || len(strings.Split(name, deploymentPrefix)) < 2{
+		if namespace != r.Namespace || !strings.HasPrefix(name, deploymentPrefix) || len(strings.Split(name, deploymentPrefix)) < 2 {
 			return []reconcile.Request{}
 		}
 
@@ -323,7 +412,7 @@ func (r *DpuNodeController) SetupWithManager(mgr ctrl.Manager) error {
 		reply := make([]reconcile.Request, 0, 1)
 		reply = append(reply, reconcile.Request{NamespacedName: types.NamespacedName{
 			Namespace: namespace,
-			Name: strings.Split(name, deploymentPrefix)[1],
+			Name:      strings.Split(name, deploymentPrefix)[1],
 		}})
 		return reply
 	}
