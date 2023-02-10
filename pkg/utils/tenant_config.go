@@ -3,13 +3,16 @@ package utils
 import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	"k8s.io/client-go/rest"
 )
+
+var TenantRestConfig *rest.Config
 
 type Config struct {
 	TenantHostname string `mapstructure:"TENANT_K8S_NODE"`
 }
 
-func LoadConfig(fileName string) (*Config, error) {
+func loadConfig(fileName string) (*Config, error) {
 	configReader := viper.New()
 	// set the config file type
 	configReader.SetConfigType("env")
@@ -28,8 +31,8 @@ func LoadConfig(fileName string) (*Config, error) {
 }
 
 // Currently mapping is provided by CM, it is not optimal and should be changed to automatic node labeling one day
-func GetMatchedTenantNodeByCM(nodeName string, log logrus.FieldLogger) (string, error) {
-	tenantConfig, err := LoadConfig(nodeName)
+func GetMatchedTenantNode(nodeName string, log logrus.FieldLogger) (string, error) {
+	tenantConfig, err := loadConfig(nodeName)
 	if err != nil {
 		log.WithError(err).Errorf("Failed to get matched tenant node from configmap mount file for node %s", nodeName)
 		return "", nil

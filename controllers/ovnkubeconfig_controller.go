@@ -37,7 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -59,7 +58,6 @@ const (
 var logger = log.Log.WithName("controller_ovnkubeconfig")
 
 // TODO: find a better way to share kubeconfig between clusters
-var TenantRestConfig *rest.Config
 
 const (
 	OVN_NB_PORT = "9641"
@@ -196,7 +194,7 @@ func (r *OVNKubeConfigReconciler) startTenantSyncer(ctx context.Context, cfg *dp
 		return fmt.Errorf("key 'config' cannot be found in secret %s", cfg.Spec.KubeConfigFile)
 	}
 
-	TenantRestConfig, err = clientcmd.RESTConfigFromKubeConfig(bytes)
+	utils.TenantRestConfig, err = clientcmd.RESTConfigFromKubeConfig(bytes)
 	if err != nil {
 		return err
 	}
@@ -205,7 +203,7 @@ func (r *OVNKubeConfigReconciler) startTenantSyncer(ctx context.Context, cfg *dp
 		// LocalClusterID:   cfg.Namespace,
 		LocalRestConfig:  ctrl.GetConfigOrDie(),
 		LocalNamespace:   cfg.Namespace,
-		TenantRestConfig: TenantRestConfig,
+		TenantRestConfig: utils.TenantRestConfig,
 		TenantNamespace:  utils.TenantNamespace}, cfg, r.Scheme)
 	if err != nil {
 		return err
@@ -381,7 +379,7 @@ func (r *OVNKubeConfigReconciler) syncMachineConfigObjs(cs dpuv1alpha1.OVNKubeCo
 }
 
 func (r *OVNKubeConfigReconciler) getTenantClusterMasterIPs(ctx context.Context) ([]string, error) {
-	c, err := client.New(TenantRestConfig, client.Options{})
+	c, err := client.New(utils.TenantRestConfig, client.Options{})
 	if err != nil {
 		logger.Error(err, "Fail to create client for the tenant cluster")
 		return []string{}, err

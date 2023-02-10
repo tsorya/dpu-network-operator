@@ -1,3 +1,4 @@
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -126,6 +127,18 @@ rules:
   - update
   - watch
 - apiGroups:
+  - nodemaintenance.medik8s.io
+  resources:
+  - nodemaintenances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - policy
   resources:
   - poddisruptionbudgets
@@ -141,14 +154,6 @@ rules:
   - security.openshift.io
   resourceNames:
   - anyuid
-  - hostnetwork
-  resources:
-  - securitycontextconstraints
-  verbs:
-  - use
-- apiGroups:
-  - security.openshift.io
-  resourceNames:
   - hostnetwork
   resources:
   - securitycontextconstraints

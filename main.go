@@ -107,7 +107,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controllers.DpuNodeLifcycleController{
+	if err = (&controllers.DpuNodeLifecycleController{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		Log:       logrus.New(),
